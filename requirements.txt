@@ -1,0 +1,71 @@
+# ============================================
+# Google Gemini - Gunakan SDK terbaru
+# ============================================
+google-genai>=0.2.0
+# google-generativeai==0.3.2  # JANGAN PAKAI (deprecated)
+
+# ============================================
+# Core Dependencies
+# ============================================
+srt>=3.5.0
+numpy>=1.24.3
+opencv-python>=4.8.1.78
+opencv-contrib-python>=4.8.1.78
+Pillow>=10.3.0
+torch>=2.1.0
+torchvision>=0.16.0
+ultralytics>=8.0.220
+
+# ============================================
+# Audio Processing
+# ============================================
+librosa>=0.10.1
+soundfile>=0.12.1
+
+# ============================================
+# YouTube Downloader
+# ============================================
+yt-dlp>=2023.11.14
+
+# ============================================
+# Database
+# ============================================
+sqlalchemy>=2.0.23
+psycopg2-binary>=2.9.9
+alembic>=1.12.1
+
+# ============================================
+# Google Services
+# ============================================
+google-api-python-client>=2.108.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+
+# ============================================
+# Web Framework
+# ============================================
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# ============================================
+# HTTP Client & Utilities
+# ============================================
+httpx>=0.25.1
+requests>=2.31.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.6
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-magic>=0.4.27
+tqdm>=4.66.1
+colorama>=0.4.6
+loguru>=0.7.2
+
+# ============================================
+# Face & Active Speaker Detection
+# ============================================
+mediapipe>=0.10.0
+opencv-python>=4.8.1.78
+opencv-contrib-python>=4.8.1.78
