@@ -224,7 +224,7 @@ def validate_clip_selection(result, hard_min_duration=15):
     
     # Kalau di bawah 60 detik (tapi di atas 15), cuma kasih warning, JANGAN CRASH
     if duration < 60:
-        print(f"   ⚠️ Info: Short clip detected ({duration:.2f}s). Accepted for virality.")
+        print(f"   Info: Short clip detected ({duration:.2f}s). Accepted for virality.")
 
     if result["start"] < 0 or result["end"] <= result["start"]:
         raise ValueError("Invalid timestamps")

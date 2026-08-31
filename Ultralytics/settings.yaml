@@ -1,0 +1,16 @@
+settings_version: 0.0.4
+datasets_dir: /Users/rikzamushoffa/PROJECT/AI_Agent_ShortVids_Whisper_cpp/datasets
+weights_dir: /Users/rikzamushoffa/PROJECT/AI_Agent_ShortVids_Whisper_cpp/weights
+runs_dir: /Users/rikzamushoffa/PROJECT/AI_Agent_ShortVids_Whisper_cpp/runs
+uuid: 5624bb85d7e7fede30724589e6495f150644d05c549de637ef972b37cc2c9c96
+sync: true
+api_key: ''
+clearml: true
+comet: true
+dvc: true
+hub: true
+mlflow: true
+neptune: true
+raytune: true
+tensorboard: true
+wandb: true

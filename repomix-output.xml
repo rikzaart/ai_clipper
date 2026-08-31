@@ -1,0 +1,3096 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+agents/
+  agent_loop.py
+  job_queue.py
+assembly/
+  crop_calculator.py
+  motion_curve.py
+  subtitle_generator.py
+ingest/
+  downloader.py
+  embeddings_updater.py
+  trending_scraper.py
+reasoning/
+  clip_selector.py
+  rag_search.py
+  viral_scorer.py
+rendering/
+  ffmpeg_builder.py
+  renderer.py
+sensing/
+  active_speaker.py
+  diarization.py
+  whisper_transcriber.py
+  yolov8_detector.py
+Ultralytics/
+  settings.yaml
+utils/
+  drive_io.py
+  file_utils.py
+  logger.py
+  sheet_io.py
+.env.example
+.gitignore
+agent.py
+docker-compose.yml
+Dockerfile
+Dockerfile.txt
+export_youtube_cookies.sh
+generate_token.py
+google_auth_setup.py
+README.md
+requirements.txt
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="Ultralytics/settings.yaml">
+settings_version: 0.0.4
+datasets_dir: /Users/rikzamushoffa/PROJECT/AI_Agent_ShortVids_Whisper_cpp/datasets
+weights_dir: /Users/rikzamushoffa/PROJECT/AI_Agent_ShortVids_Whisper_cpp/weights
+runs_dir: /Users/rikzamushoffa/PROJECT/AI_Agent_ShortVids_Whisper_cpp/runs
+uuid: 5624bb85d7e7fede30724589e6495f150644d05c549de637ef972b37cc2c9c96
+sync: true
+api_key: ''
+clearml: true
+comet: true
+dvc: true
+hub: true
+mlflow: true
+neptune: true
+raytune: true
+tensorboard: true
+wandb: true
+</file>
+
+
+<file path="agents/agent_loop.py">
+import time
+import traceback
+from pathlib import Path
+import cv2
+
+from ingest.downloader import download_youtube
+from sensing.whisper_transcriber import extract_audio, whisper_transcribe
+from sensing.active_speaker import detect_shots_and_crops
+from assembly.subtitle_generator import slice_and_offset_transcript
+from rendering.renderer import render_final_video
+from utils.drive_io import upload_to_drive
+from reasoning.clip_selector import select_multi_clips_gemini
+from agents.job_queue import fetch_job, mark_started
+from utils.sheet_io import update_status, append_clip_to_sheet, mark_job_complete
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RAW_FOLDER_ID = "16ITj9gRgoYKgHUIa-qtXUHW4IoU03p6y"
+FINISH_FOLDER_ID = "1l10aEE7w11UlHEhojzY-3ePJ_oyqIlzQ"
+
+
+def run_agent(sheet, drive_service, SPREADSHEET_ID):
+    print("=" * 60)
+    print("🤖 AI AGENT STARTED (Shot-Aware Layout Engine)")
+    print("=" * 60)
+
+    while True:
+        try:
+            row, job = fetch_job(sheet, SPREADSHEET_ID, "Jobs!A2:E")
+            if not job:
+                time.sleep(5)
+                continue
+
+            job_id = job["job_id"]
+            youtube_url = job["youtube_url"]
+            target_channel = job.get("upload_channel", "main")
+
+            print(f"\n📝 Processing job: {job_id}\n🔗 URL: {youtube_url}")
+            mark_started(sheet, SPREADSHEET_ID, row)
+
+            raw_path = PROJECT_ROOT / "raw" / f"{job_id}.mp4"
+            audio_path = PROJECT_ROOT / "temp" / f"{job_id}.wav"
+            transcript_out = PROJECT_ROOT / "temp" / f"{job_id}.json"
+
+            for p in [raw_path, audio_path, transcript_out]:
+                p.parent.mkdir(parents=True, exist_ok=True)
+
+            # STEP 1: Download & Transcribe
+            download_youtube(youtube_url, str(raw_path))
+            extract_audio(str(raw_path), str(audio_path))
+            whisper_transcribe(str(audio_path), str(transcript_out), fast_mode=True)
+
+            # STEP 2: Gemini Clip Selection
+            try:
+                multi_clips = select_multi_clips_gemini(str(transcript_out), min_duration=30, max_duration=180, n=10)
+                if not multi_clips:
+                    raise ValueError("No clips returned")
+            except Exception as e:
+                print(f"⚠️ Gemini fallback: {e}")
+                multi_clips = [{'start': 0, 'end': 60, 'title': 'Fallback', 'description': '', 'tags': '#shorts'}]
+
+            # STEP 3: Video Metadata
+            cap = cv2.VideoCapture(str(raw_path))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            duration = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) / fps
+            cap.release()
+
+            raw_fid = None
+            finished_fids = []
+
+            # STEP 4: Process Clips
+            for idx, clip in enumerate(multi_clips):
+                clip_start = float(clip['start'])
+                clip_end = float(clip['end'])
+                clip_title = clip.get('title', f'Clip {idx+1}')
+
+                subtitle_path = PROJECT_ROOT / "temp" / f"{job_id}_clip{idx+1:02d}.ass"
+                finished_path = PROJECT_ROOT / "finished" / f"{job_id}_clip{idx+1:02d}.mp4"
+                subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+                finished_path.parent.mkdir(parents=True, exist_ok=True)
+
+                print(f"\n🎬 Clip {idx+1}: {clip_title} ({clip_start:.1f}s - {clip_end:.1f}s)")
+
+                # Shot detection & auto-layout (single vs split)
+                shots_plan = detect_shots_and_crops(str(raw_path), clip_start, clip_end)
+
+                # Subtitle sync
+                slice_and_offset_transcript(str(transcript_out), str(subtitle_path), clip_start, clip_end)
+
+                # FFmpeg Render
+                render_final_video(
+                    input_path=str(raw_path),
+                    start_time=clip_start,
+                    end_time=min(clip_end, duration),
+                    output_path=str(finished_path),
+                    shots=shots_plan,
+                    subtitle_path=str(subtitle_path) if subtitle_path.exists() else None,
+                    target_width=1080,
+                    target_height=1920,
+                    color_grading="kodak_portra",
+                    annotation_text=clip.get('annotation_text'),
+                    annotation_start_offset=clip.get('annotation_start_offset', 5.0),
+                )
+
+                # Uploads
+                if idx == 0:
+                    raw_fid = upload_to_drive(str(raw_path), RAW_FOLDER_ID, drive_service)
+                fin_fid = upload_to_drive(str(finished_path), FINISH_FOLDER_ID, drive_service)
+                finished_fids.append(fin_fid)
+
+                append_clip_to_sheet(
+                    sheet=sheet,
+                    SPREADSHEET_ID=SPREADSHEET_ID,
+                    parent_job_id=job_id,
+                    drive_file_id=fin_fid,
+                    title=clip_title,
+                    description=clip.get('description', ''),
+                    tags=clip.get('tags', '#short #viral'),
+                    target_channel=target_channel,
+                )
+
+            # Mark Complete
+            mark_job_complete(
+                sheet=sheet,
+                SPREADSHEET_ID=SPREADSHEET_ID,
+                row=row,
+                raw_fid=raw_fid or (finished_fids[0] if finished_fids else ""),
+                fin_fid=finished_fids[-1] if finished_fids else "",
+            )
+            print(f"✅ Job {job_id} Completed ({len(multi_clips)} clips)")
+
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            traceback.print_exc()
+            try:
+                update_status(sheet, SPREADSHEET_ID, row, "error")
+            except Exception:
+                pass
+            time.sleep(5)
+</file>
+
+<file path="agents/job_queue.py">
+from utils.sheet_io import (
+    get_pending_job,
+    update_status,
+    update_raw_file_id,
+    update_finished_file_id,
+    update_clip_metadata
+)
+
+def fetch_job(sheet, spreadsheet_id, range_name):
+    return get_pending_job(sheet, spreadsheet_id, range_name)
+
+def mark_started(sheet, spreadsheet_id, row):
+    update_status(sheet, spreadsheet_id, row, "processing")
+
+def mark_done(sheet, spreadsheet_id, row, raw_id, finished_id, title=None, description=None, viral_score=None):
+    update_raw_file_id(sheet, spreadsheet_id, row, raw_id)
+    update_finished_file_id(sheet, spreadsheet_id, row, finished_id)
+
+    # Update clip metadata from Gemini AI (if available)
+    if title and description and viral_score:
+        update_clip_metadata(sheet, spreadsheet_id, row, title, description, viral_score)
+
+    update_status(sheet, spreadsheet_id, row, "done")
+</file>
+
+<file path="assembly/crop_calculator.py">
+"""
+Dynamic Crop Calculator untuk Vertical Video
+
+Menghitung crop coordinates berdasarkan face positions
+untuk membuat vertical video (9:16) yang focus ke wajah pembicara.
+"""
+
+import numpy as np
+from assembly.motion_curve import smooth_motion, interpolate_missing_frames
+
+
+def compute_dynamic_crop(
+    face_positions,
+    video_width,
+    video_height,
+    target_width=1080,
+    target_height=1920,
+    smoothing_alpha=0.25
+):
+    """
+    Compute dynamic crop coordinates untuk vertical video
+
+    Args:
+        face_positions: List of face positions dari YOLO detection
+        video_width: Original video width
+        video_height: Original video height
+        target_width: Target width (default: 1080 for 9:16)
+        target_height: Target height (default: 1920 for 9:16)
+        smoothing_alpha: Smoothing factor untuk motion (default: 0.25)
+
+    Returns:
+        Dict dengan crop parameters:
+        {
+            "x": 100,        # Top-left x coordinate
+            "y": 0,          # Top-left y coordinate
+            "width": 1080,   # Crop width
+            "height": 1920,  # Crop height
+            "center_x": 0.5, # Normalized center x (0.0 - 1.0)
+            "center_y": 0.5, # Normalized center y (0.0 - 1.0)
+            "valid": True    # Whether crop is valid
+        }
+    """
+
+    # Calculate target aspect ratio
+    target_aspect = target_width / target_height  # 9:16 = 0.5625
+
+    # Calculate crop dimensions based on video size
+    # We want to crop to 9:16 aspect ratio
+    if video_width / video_height > target_aspect:
+        # Video is wider than target, crop width
+        crop_height = video_height
+        crop_width = int(crop_height * target_aspect)
+    else:
+        # Video is taller than target, crop height
+        crop_width = video_width
+        crop_height = int(crop_width / target_aspect)
+
+    # Ensure crop dimensions are valid
+    crop_width = min(crop_width, video_width)
+    crop_height = min(crop_height, video_height)
+
+    # Ensure crop dimensions are even (required by ffmpeg)
+    crop_width = crop_width - (crop_width % 2)
+    crop_height = crop_height - (crop_height % 2)
+
+    # Determine center position based on face positions
+    if face_positions and len(face_positions) > 0:
+        # Smooth face positions
+        smoothed_positions = smooth_motion(face_positions, alpha=smoothing_alpha)
+
+        # Calculate average center position
+        avg_center_x = np.mean([p["center_x"] for p in smoothed_positions])
+        avg_center_y = np.mean([p["center_y"] for p in smoothed_positions])
+
+        print(f"📍 Face detected: center at ({avg_center_x:.2f}, {avg_center_y:.2f})")
+    else:
+        # No faces detected, use center
+        avg_center_x = 0.5
+        avg_center_y = 0.5
+        print(f"⚠️  No faces detected, using center crop")
+
+    # Calculate crop position
+    # Center the crop around the detected face
+    crop_x = int((avg_center_x * video_width) - (crop_width / 2))
+    crop_y = int((avg_center_y * video_height) - (crop_height / 2))
+
+    # Ensure crop is within video bounds
+    crop_x = max(0, min(crop_x, video_width - crop_width))
+    crop_y = max(0, min(crop_y, video_height - crop_height))
+
+    # Validate crop parameters
+    valid = (
+        crop_width > 0 and
+        crop_height > 0 and
+        crop_x >= 0 and
+        crop_y >= 0 and
+        crop_x + crop_width <= video_width and
+        crop_y + crop_height <= video_height
+    )
+
+    if not valid:
+        print(f"❌ Invalid crop parameters!")
+        print(f"   Video: {video_width}x{video_height}")
+        print(f"   Crop: {crop_width}x{crop_height} at ({crop_x}, {crop_y})")
+        print(f"   Using fallback: center crop")
+
+        # Fallback to center crop
+        crop_x = (video_width - crop_width) // 2
+        crop_y = (video_height - crop_height) // 2
+        crop_x = max(0, crop_x)
+        crop_y = max(0, crop_y)
+
+    result = {
+        "x": crop_x,
+        "y": crop_y,
+        "width": crop_width,
+        "height": crop_height,
+        "center_x": avg_center_x,
+        "center_y": avg_center_y,
+        "valid": valid
+    }
+
+    print(f"✂️  Crop: {crop_width}x{crop_height} at ({crop_x}, {crop_y})")
+    print(f"   Target: {target_width}x{target_height}")
+
+    return result
+
+
+def validate_crop_params(crop_params, video_width, video_height):
+    """
+    Validate crop parameters to prevent corrupt video
+
+    Args:
+        crop_params: Crop parameters dict
+        video_width: Original video width
+        video_height: Original video height
+
+    Returns:
+        True if valid, False otherwise
+    """
+
+    x = crop_params.get("x", 0)
+    y = crop_params.get("y", 0)
+    w = crop_params.get("width", 0)
+    h = crop_params.get("height", 0)
+
+    # Check for zero dimensions (causes corrupt video)
+    if w <= 0 or h <= 0:
+        print(f"❌ Invalid crop: width={w}, height={h} (must be > 0)")
+        return False
+
+    # Check for out of bounds
+    if x < 0 or y < 0:
+        print(f"❌ Invalid crop: x={x}, y={y} (must be >= 0)")
+        return False
+
+    if x + w > video_width or y + h > video_height:
+        print(f"❌ Invalid crop: exceeds video bounds")
+        print(f"   Video: {video_width}x{video_height}")
+        print(f"   Crop: {w}x{h} at ({x}, {y})")
+        return False
+
+    # Check for even dimensions (required by some codecs)
+    if w % 2 != 0 or h % 2 != 0:
+        print(f"⚠️  Warning: crop dimensions not even (w={w}, h={h})")
+        print(f"   Some codecs may fail. Adjusting...")
+        return False
+
+    return True
+</file>
+
+<file path="assembly/motion_curve.py">
+"""
+Motion Curve Smoothing untuk Crop Coordinates
+
+Menggunakan exponential moving average (EMA) untuk smooth crop coordinates
+dan mencegah jittery/shaky video.
+"""
+
+import numpy as np
+
+
+def smooth_motion(coords_list, alpha=0.25):
+    """
+    Smooth motion coordinates menggunakan Exponential Moving Average (EMA)
+
+    Formula: x_smooth = alpha * x_new + (1 - alpha) * x_prev
+
+    Args:
+        coords_list: List of coordinates, format:
+            [
+                {"time": 0.0, "center_x": 0.5, "center_y": 0.5},
+                {"time": 1.0, "center_x": 0.6, "center_y": 0.5},
+                ...
+            ]
+        alpha: Smoothing factor (0.0 - 1.0)
+            - 0.0 = no change (very smooth, very laggy)
+            - 1.0 = no smoothing (jittery)
+            - 0.2-0.35 = ideal for face tracking
+            - Default: 0.25
+
+    Returns:
+        Smoothed coordinates list dengan format yang sama
+    """
+
+    if not coords_list or len(coords_list) == 0:
+        return coords_list
+
+    if len(coords_list) == 1:
+        return coords_list
+
+    # Sort by time
+    sorted_coords = sorted(coords_list, key=lambda x: x.get("time", 0))
+
+    # Initialize with first coordinate
+    smoothed = [sorted_coords[0].copy()]
+
+    # Apply EMA smoothing
+    for i in range(1, len(sorted_coords)):
+        curr = sorted_coords[i]
+        prev_smooth = smoothed[-1]
+
+        # Smooth center_x
+        if "center_x" in curr and "center_x" in prev_smooth:
+            smooth_x = alpha * curr["center_x"] + (1 - alpha) * prev_smooth["center_x"]
+        else:
+            smooth_x = curr.get("center_x", 0.5)
+
+        # Smooth center_y
+        if "center_y" in curr and "center_y" in prev_smooth:
+            smooth_y = alpha * curr["center_y"] + (1 - alpha) * prev_smooth["center_y"]
+        else:
+            smooth_y = curr.get("center_y", 0.5)
+
+        # Create smoothed coordinate
+        smoothed_coord = curr.copy()
+        smoothed_coord["center_x"] = smooth_x
+        smoothed_coord["center_y"] = smooth_y
+
+        # Keep original values for reference
+        smoothed_coord["original_x"] = curr.get("center_x", 0.5)
+        smoothed_coord["original_y"] = curr.get("center_y", 0.5)
+
+        smoothed.append(smoothed_coord)
+
+    return smoothed
+
+
+def interpolate_missing_frames(face_positions, total_frames, fps):
+    """
+    Interpolate face positions untuk frame yang tidak ada detection
+
+    Args:
+        face_positions: List of detected face positions
+        total_frames: Total frames di video
+        fps: Frame rate video
+
+    Returns:
+        Interpolated positions untuk semua frames
+    """
+
+    if not face_positions or len(face_positions) == 0:
+        # No faces detected, return center position for all frames
+        return [
+            {
+                "frame_idx": i,
+                "time": i / fps if fps > 0 else 0,
+                "center_x": 0.5,
+                "center_y": 0.5,
+                "interpolated": True
+            }
+            for i in range(total_frames)
+        ]
+
+    # Sort by frame index
+    sorted_faces = sorted(face_positions, key=lambda x: x.get("frame_idx", 0))
+
+    # Create interpolated list
+    interpolated = []
+
+    for frame_idx in range(total_frames):
+        time = frame_idx / fps if fps > 0 else 0
+
+        # Find closest detections before and after this frame
+        before = None
+        after = None
+
+        for face in sorted_faces:
+            if face["frame_idx"] <= frame_idx:
+                before = face
+            elif face["frame_idx"] > frame_idx and after is None:
+                after = face
+                break
+
+        # Interpolate
+        if before and after:
+            # Linear interpolation between before and after
+            t = (frame_idx - before["frame_idx"]) / (after["frame_idx"] - before["frame_idx"])
+            center_x = before["center_x"] + t * (after["center_x"] - before["center_x"])
+            center_y = before["center_y"] + t * (after["center_y"] - before["center_y"])
+            interpolated_flag = True
+        elif before:
+            # Use last known position
+            center_x = before["center_x"]
+            center_y = before["center_y"]
+            interpolated_flag = True
+        elif after:
+            # Use next known position
+            center_x = after["center_x"]
+            center_y = after["center_y"]
+            interpolated_flag = True
+        else:
+            # No detection at all, use center
+            center_x = 0.5
+            center_y = 0.5
+            interpolated_flag = True
+
+        interpolated.append({
+            "frame_idx": frame_idx,
+            "time": time,
+            "center_x": center_x,
+            "center_y": center_y,
+            "interpolated": interpolated_flag
+        })
+
+    return interpolated
+</file>
+
+<file path="assembly/subtitle_generator.py">
+"""
+ASS Karaoke Subtitle Generator
+
+Generate ASS subtitle dengan karaoke effect menggunakan word-level timestamps
+dari whisper-timestamped.
+"""
+
+import json
+import copy
+from pathlib import Path
+
+
+def generate_ass_subtitle(transcript_json_path, ass_path):
+    """
+    Generate ASS karaoke subtitle dari transcript JSON
+
+    Args:
+        transcript_json_path: Path ke transcript JSON dengan word-level timestamps
+        ass_path: Path ke output ASS file
+
+    Returns:
+        ass_path jika berhasil
+    """
+
+    print(f"💬 Generating ASS karaoke subtitle...")
+    print(f"   Input: {transcript_json_path}")
+    print(f"   Output: {ass_path}")
+
+    # Load transcript
+    try:
+        transcript_json_path = str(Path(transcript_json_path).resolve())
+        with open(transcript_json_path, "r", encoding="utf-8") as f:
+            transcript = json.load(f)
+    except Exception as e:
+        print(f"⚠️  Error loading transcript: {e}")
+        print(f"   Creating empty subtitle file")
+        # Create empty subtitle
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(_get_ass_header())
+        return ass_path
+
+    # Check if word-level timestamps exist
+    segments = transcript.get("segments", [])
+    has_word_timestamps = False
+
+    if segments and len(segments) > 0:
+        first_segment = segments[0]
+        if "words" in first_segment and len(first_segment.get("words", [])) > 0:
+            has_word_timestamps = True
+
+    print(f"   Segments: {len(segments)}")
+    print(f"   Word-level timestamps: {'Yes' if has_word_timestamps else 'No'}")
+
+    # Generate ASS content
+    ass_content = _get_ass_header()
+
+    if has_word_timestamps:
+        # Generate karaoke subtitle with word-level timing
+        ass_content += _generate_karaoke_events(segments)
+        print(f"   Generated karaoke subtitle with word-level timing")
+    else:
+        # Fallback to segment-level subtitle
+        ass_content += _generate_simple_events(segments)
+        print(f"   Generated simple subtitle (no word-level timing)")
+        # Fix 4: Join all text if words empty, create one long simple subtitle
+        if not has_word_timestamps and len(segments) > 0:
+            full_text = " ".join([s.get("text", "").strip() for s in segments if s.get("text")])
+            if full_text:
+                ass_content += _generate_simple_events([{"start": 0, "end": 60, "text": full_text}])
+
+    # Write to file
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+
+    print(f"✅ Subtitle generated: {ass_path}")
+
+    return ass_path
+
+
+def _offset_word_timing(words, start_time):
+    """Menggeser timestamp kata-kata (word-level) ke belakang."""
+    offset_words = []
+    for word in words:
+        new_word = copy.deepcopy(word)
+        # Pastikan tidak ada waktu negatif
+        new_word["start"] = max(0.0, word.get("start", 0.0) - start_time)
+        new_word["end"] = max(new_word["start"], word.get("end", 0.0) - start_time) 
+        offset_words.append(new_word)
+    return offset_words
+
+
+def slice_and_offset_transcript(transcript_json_path, ass_path, clip_start, clip_end):
+    """
+    Memotong transkrip JSON sesuai durasi klip dan mereset (offset) timestamp-nya.
+
+    Args:
+        transcript_json_path: Path ke transcript JSON
+        ass_path: Path ke output ASS file
+        clip_start: Waktu mulai klip (dalam detik)
+        clip_end: Waktu akhir klip (dalam detik)
+
+    Returns:
+        ass_path jika berhasil
+    """
+    print(f"💬 Slicing & Offseting transcript for clip...")
+    print(f"   Input: {transcript_json_path}")
+    print(f"   Output: {ass_path}")
+    print(f"   Clip Range: {clip_start:.2f}s - {clip_end:.2f}s")
+
+    try:
+        transcript_json_path = str(Path(transcript_json_path).resolve())
+        with open(transcript_json_path, "r", encoding="utf-8") as f:
+            full_data = json.load(f)
+    except Exception as e:
+        print(f"⚠️  Error loading transcript: {e}")
+        print(f"   Creating empty subtitle file")
+        # Create empty subtitle
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(_get_ass_header())
+        return ass_path
+
+    # 1. SLICING: Filter segments yang masuk dalam clip
+    segments = full_data.get("segments", [])
+    clipped_segments = []
+    
+    for segment in segments:
+        seg_start = segment.get("start", 0.0)
+        seg_end = segment.get("end", 0.0)
+
+        # Hanya ambil segment yang bersinggungan/masuk dalam clip
+        if seg_end > clip_start and seg_start < clip_end:
+            new_segment = copy.deepcopy(segment)
+
+            # 2. OFFSET: Geser waktu
+            new_segment["start"] = max(0.0, seg_start - clip_start)
+            new_segment["end"] = min(clip_end - clip_start, seg_end - clip_start)
+            
+            # Geser waktu di level word-level juga (penting untuk karaoke)
+            if "words" in new_segment:
+                valid_words = []
+                for word in new_segment["words"]:
+                    w_start = word.get("start", 0.0)
+                    w_end = word.get("end", 0.0)
+                    if w_end > clip_start and w_start < clip_end:
+                        word["start"] = max(0.0, w_start - clip_start)
+                        word["end"] = max(word["start"], w_end - clip_start)
+                        valid_words.append(word)
+                new_segment["words"] = valid_words
+
+            clipped_segments.append(new_segment)
+
+    # Check if word-level timestamps exist
+    has_word_timestamps = False
+    if clipped_segments and len(clipped_segments) > 0:
+        first_segment = clipped_segments[0]
+        if "words" in first_segment and len(first_segment.get("words", [])) > 0:
+            has_word_timestamps = True
+
+    print(f"   Segments after clipping: {len(clipped_segments)}")
+    print(f"   Word-level timestamps: {'Yes' if has_word_timestamps else 'No'}")
+
+    # 3. GENERATE ASS dari data yang sudah dipotong
+    ass_content = _get_ass_header()
+    
+    if has_word_timestamps:
+        ass_content += _generate_karaoke_events(clipped_segments)
+        print(f"   Generated karaoke subtitle with word-level timing")
+    else:
+        ass_content += _generate_simple_events(clipped_segments)
+        print(f"   Generated simple subtitle (no word-level timing)")
+         
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+        
+    print(f"✅ Subtitle saved & synced: {ass_path}")
+    return ass_path
+
+
+def _get_ass_header():
+    """Generate ASS file header dengan dua style font (Normal & Emphasis), tanpa outline, dan posisi subtitle center bawah"""
+    return """[Script Info]
+Title: AI Agent Short Video
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1080
+PlayResY: 1920
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Normal,Alte Haas Grotesk,100,&H00E0FAFE,&H00CAFD,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,0,0,2,60,60,300,1
+Style: Emphasis,Apple Garamond,110,&H00CDEDFA,&H00CAFD,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,0,0,2,60,60,300,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def _generate_karaoke_events(segments, max_words_per_line=7, max_duration=2.5, time_offset=0.12):
+    """
+    Generate karaoke events dengan word-level timing, chunking, dua style font, dan posisi center bawah
+    """
+    events = []
+    # Center bawah: x=540 (tengah), y=1500 (agak bawah, bisa disesuaikan)
+    pos_x = 540
+    pos_y = 1500
+    pos_tag = f"{{\\pos({pos_x},{pos_y})}}"
+    for segment in segments:
+        words = segment.get("words", [])
+        if not words or len(words) == 0:
+            continue
+        chunks = _chunk_words(words, max_words_per_line, max_duration)
+        for chunk in chunks:
+            if not chunk:
+                continue
+            chunk_start = chunk[0].get("start", 0.0) + time_offset
+            chunk_end = chunk[-1].get("end", 0.0) + time_offset
+            karaoke_text = pos_tag
+            for word in chunk:
+                word_text = word.get("text", "").strip()
+                word_start = word.get("start", 0.0)
+                word_end = word.get("end", 0.0)
+                duration_cs = int((word_end - word_start) * 100)
+                if duration_cs < 10:
+                    duration_cs = 10
+                if word_text.isupper() and len(word_text) > 1:
+                    karaoke_text += f"{{\\rEmphasis}}{{\\k{duration_cs}}}{word_text}{{\\rNormal}} "
+                else:
+                    karaoke_text += f"{{\\k{duration_cs}}}{word_text} "
+            start_formatted = _format_timestamp(chunk_start)
+            end_formatted = _format_timestamp(chunk_end)
+            dialogue = f"Dialogue: 0,{start_formatted},{end_formatted},Normal,,0,0,0,,{karaoke_text.strip()}\n"
+            events.append(dialogue)
+    return "".join(events)
+
+
+def _chunk_words(words, max_words, max_duration):
+    """
+    Chunk words into smaller groups berdasarkan:
+    - Max words per line
+    - Max duration per line
+    - Natural pauses (punctuation)
+
+    Returns:
+        List of word chunks
+    """
+    chunks = []
+    current_chunk = []
+
+    for i, word in enumerate(words):
+        current_chunk.append(word)
+
+        # Check if we should break
+        should_break = False
+
+        # Break if max words reached
+        if len(current_chunk) >= max_words:
+            should_break = True
+
+        # Break if max duration reached
+        if current_chunk:
+            chunk_duration = current_chunk[-1].get("end", 0.0) - current_chunk[0].get("start", 0.0)
+            if chunk_duration >= max_duration:
+                should_break = True
+
+        # Break at punctuation
+        word_text = word.get("text", "").strip()
+        if word_text.endswith((",", ".", "!", "?", "ya", "gitu", "nih")):
+            should_break = True
+
+        # Break if this is the last word
+        if i == len(words) - 1:
+            should_break = True
+
+        if should_break and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = []
+
+    return chunks
+
+
+def _generate_simple_events(segments):
+    """
+    Generate simple subtitle events (fallback tanpa word-level timing)
+    """
+    events = []
+
+    for segment in segments:
+        text = segment.get("text", "").strip()
+        start_time = segment.get("start", 0.0)
+        end_time = segment.get("end", 0.0)
+
+        if not text:
+            continue
+
+        # Format timestamps
+        start_formatted = _format_timestamp(start_time)
+        end_formatted = _format_timestamp(end_time)
+
+        # Create dialogue line
+        dialogue = f"Dialogue: 0,{start_formatted},{end_formatted},Default,,0,0,0,,{text}\n"
+        events.append(dialogue)
+
+    return "".join(events)
+
+
+def _format_timestamp(seconds):
+    """
+    Format timestamp untuk ASS format: H:MM:SS.CS
+
+    Args:
+        seconds: Time dalam detik (float)
+
+    Returns:
+        Formatted string (e.g., "0:01:23.45")
+    """
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    centiseconds = int((seconds % 1) * 100)
+
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+</file>
+
+<file path="ingest/downloader.py">
+"""
+downloader.py
+YouTube Downloader Anti-Bot untuk AI Clipper
+"""
+
+import os
+import random
+import shutil
+import time
+from pathlib import Path
+from typing import Any
+
+import yt_dlp
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+]
+
+def _build_base_ydl_opts(output_path: str) -> dict[str, Any]:
+    ua = random.choice(USER_AGENTS)
+    out_dir = Path(output_path).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    has_ffmpeg = shutil.which("ffmpeg") is not None
+
+    ydl_opts: dict[str, Any] = {
+        "outtmpl": output_path,
+        "retries": 10,
+        "fragment_retries": 10,
+        "ignoreerrors": False,
+        "user_agent": ua,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "web_embedded"],
+                "skip": ["webpage"],
+            }
+        },
+        "remote_components": ["ejs:github"],  # Fix: Must be a List, not string
+        "throttledratelimit": 1000000,
+        "sleep_interval": 3,
+        "max_sleep_interval": 10,
+        "headers": {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.youtube.com/",
+            "Origin": "https://www.youtube.com",
+        },
+        "verbose": False,
+        "quiet": False,
+        "no_warnings": False,
+    }
+
+    # Jika FFmpeg terinstall di OS/environment, izinkan merging high-quality video+audio
+    if has_ffmpeg:
+        ydl_opts["merge_output_format"] = "mp4"
+        ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }]
+    else:
+        # Fallback: Ambil format pre-merged tunggal agar tidak membutuhkan FFmpeg
+        print("⚠️ FFmpeg tidak ditemukan di PATH. Menggunakan format single-stream (pre-merged)...")
+        ydl_opts["format"] = "best[ext=mp4]/best"
+
+    return ydl_opts
+
+
+def _try_cookiefile_option(ydl_opts: dict[str, Any], cookie_file: str | None) -> bool:
+    if cookie_file and Path(cookie_file).is_file():
+        ydl_opts["cookiefile"] = str(cookie_file)
+        print(f"🔐 Menggunakan cookies dari file: {cookie_file}")
+        return True
+    return False
+
+
+def _try_cookies_from_browser(ydl_opts: dict[str, Any]) -> bool:
+    browser_from_env = os.environ.get("YT_BROWSER")
+    browser_profile = os.environ.get("YT_BROWSER_PROFILE")
+
+    if browser_from_env:
+        if browser_profile:
+            ydl_opts["cookiesfrombrowser"] = (browser_from_env, browser_profile)
+        else:
+            ydl_opts["cookiesfrombrowser"] = (browser_from_env,)
+        return True
+
+    for b in ("chrome", "safari", "firefox"):
+        ydl_opts["cookiesfrombrowser"] = (b,)
+        return True
+
+    return False
+
+
+class DownloadError(Exception):
+    """Raised when a YouTube download operation fails."""
+
+
+def download_youtube(
+    url: str,
+    output_path: str,
+    use_cookies: bool = True,
+    cookie_file: str | None = None,
+) -> str:
+    if not url or not url.startswith("http"):
+        raise ValueError(f"URL tidak valid: {url}")
+
+    ydl_opts = _build_base_ydl_opts(output_path)
+
+    if use_cookies:
+        cookies_applied = _try_cookiefile_option(ydl_opts, cookie_file)
+        if not cookies_applied:
+            cookies_applied = _try_cookiefile_option(ydl_opts, os.environ.get("COOKIES_FILE"))
+        if not cookies_applied:
+            _try_cookies_from_browser(ydl_opts)
+
+    time.sleep(random.uniform(1.0, 3.0))
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            print(f"⬇️  Mulai download: {url}")
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise Exception("yt-dlp gagal mendapatkan info video.")
+            title = info.get("title") or "Unknown title"
+            print(f"✅ Download selesai: {title}")
+            return output_path
+    except yt_dlp.utils.DownloadError as e:
+        raise DownloadError(f"Download gagal: {e}") from e
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 3:
+        print("Usage: python downloader.py <youtube_url> <output_path>")
+        sys.exit(1)
+    download_youtube(sys.argv[1], sys.argv[2])
+</file>
+
+<file path="ingest/embeddings_updater.py">
+def update_embeddings_from_trends(trend_data):
+    # TODO: update ChromaDB / FAISS embeddings
+    pass
+</file>
+
+<file path="ingest/trending_scraper.py">
+def scrape_trending_topics():
+    # TODO: Tambah scraping Tiktok, Twitter, IG Reels
+    return []
+</file>
+
+<file path="reasoning/clip_selector.py">
+import json
+from google import genai
+from dotenv import load_dotenv
+import os
+import re
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found in .env file!")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# ------------ SYSTEM PROMPT (REVISED) ---------------
+SYSTEM_PROMPT = """
+You are an expert AI video clip selector for short-form content (TikTok, Instagram Reels, YouTube Shorts).
+Your job is to analyze a long transcript and select the BEST 30–60 second clip that will go VIRAL.
+
+CRITICAL RULES:
+1. **HOOK FIRST** - The clip MUST have a STRONG HOOK within the first 2-3 seconds
+2. **COMPLETE ARGUMENT** - Clip must be standalone. Problem -> Analysis -> Conclusion.
+3. **NO FILLER** - Remove "um", "uh", boring intros.
+4. **VIRAL POTENTIAL** - Choose segments with high emotional or informational value.
+
+OUTPUT FORMAT (JSON):
+{
+  "start": 12.5,
+  "end": 45.8,
+  "duration": 33.3,
+  "title": "Judul Viral",
+  "description": "Deskripsi singkat",
+  "hook": "Kalimat pertama",
+  "reason": "Kenapa ini viral",
+  "viral_score": 8.5,
+  "tags": ["tag1", "tag2"],
+  "key_insight": "Insight utama"
+}
+"""
+
+SYSTEM_PROMPT_MULTI = """
+You are an expert AI video clip selector. Analyze the transcript and select the BEST 5-10 viral clips.
+
+CRITICAL DURATION RULES:
+1. **PREFERRED DURATION**: 45 to 90 seconds (Best for retention & monetization).
+2. **MINIMUM DURATION**: 30 seconds (Absolute minimum).
+3. **CONTEXT IS KING**: Do not cut a sentence in half just to fit the time. Extend the clip slightly if needed to complete the thought.
+
+NEW RULE FOR MONETIZATION:
+4. **ADD VALUE** - For each clip, generate a single, bold, analytical or humorous annotation text that adds unique context or highlights a key moment.
+
+OUTPUT FORMAT (LIST OF JSON):
+[
+  {
+    "start": 10.0,
+    "end": 65.0,
+    "duration": 55.0,
+    "title": "...",
+    "description": "...",
+    "hook": "...",
+    "reason": "...",
+    "viral_score": 9.0,
+    "tags": [],
+    "key_insight": "...",
+    "annotation_text": "FAKTA BARU: Sesuatu yang gila terjadi di detik ini.", # <-- FIELD BARU
+    "annotation_start_offset": 5.0 # <-- FIELD BARU: Waktu kemunculan (detik), relatif dari start klip.
+  },
+  ...
+]
+"""
+
+
+def select_clip_gemini(transcript_path: str, min_duration=30, max_duration=60):
+    """Single clip selection"""
+    print("🧠 GEMINI AI REASONING - Selecting best clip...")
+    
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        transcript_data = json.load(f)
+
+    transcript_text = format_transcript_for_gemini(transcript_data)
+
+    user_input = f"""
+TRANSCRIPT DATA:
+{transcript_text[:30000]}
+
+REQUIREMENTS:
+- Find the single BEST viral clip.
+- Duration target: {min_duration}s - {max_duration}s.
+- Return ONLY valid JSON.
+"""
+
+    chat = client.chats.create(model="gemini-flash-lite-latest")
+
+    try:
+        response = chat.send_message(
+            SYSTEM_PROMPT + "\n\n" + user_input
+        )
+        result = parse_gemini_response(response.text)
+        # Pass hard_min=15 to prevent crashing on slightly short clips
+        validate_clip_selection(result, hard_min_duration=15)
+        return result
+
+    except Exception as e:
+        print(f"❌ Gemini API error: {e}")
+        raise
+
+
+def select_multi_clips_gemini(transcript_path: str, min_duration=30, max_duration=180, n=10):
+    """
+    Select multiple viral clips.
+    """
+    print(f"🧠 GEMINI AI REASONING - Selecting {n} clips...")
+    print(f"   Target Duration: {min_duration}s - {max_duration}s")
+
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        transcript_data = json.load(f)
+
+    transcript_text = format_transcript_for_gemini(transcript_data)
+
+    user_input = f"""
+TRANSCRIPT DATA:
+{transcript_text[:45000]}
+
+TASK:
+- Select {n} distinct viral clips.
+- PREFERRED Duration: {min_duration}s to {max_duration}s.
+- If a clip is extremely good but slightly shorter ({min_duration-10}s), INCLUDE IT.
+- For each clip, generate a **single, bold, analytical or humorous annotation text** that adds context or highlights a key moment.
+- Provide the **annotation_start_offset** (time in seconds from the clip start) where this annotation should appear and be displayed for 5 seconds.
+- Output strictly a JSON List.
+"""
+
+    chat = client.chats.create(model="gemini-flash-lite-latest")
+    try:
+        response = chat.send_message(
+            SYSTEM_PROMPT_MULTI + "\n\n" + user_input
+        )
+        
+        # Parse Response
+        response_text = response.text.strip()
+        # Clean markdown
+        response_text = re.sub(r'^```json\s*', '', response_text)
+        response_text = re.sub(r'^```\s*', '', response_text)
+        response_text = re.sub(r'\s*```$', '', response_text)
+
+        try:
+            result = json.loads(response_text)
+        except:
+            # Fallback regex extraction if JSON is messy
+            match = re.search(r'\[.*\]', response_text, re.DOTALL)
+            if match:
+                result = json.loads(match.group(0))
+            else:
+                raise ValueError("Could not parse JSON list from Gemini response")
+
+        valid_clips = []
+        for clip in result:
+            if not isinstance(clip, dict): continue
+            try:
+                # Disini kuncinya: Kita gunakan Hard Limit 15 detik.
+                # Biarkan clip 30s-50s lolos meskipun setting di agent_loop 60s.
+                validate_clip_selection(clip, hard_min_duration=15)
+                valid_clips.append(clip)
+            except Exception as e:
+                print(f"⚠️  Skipping truly invalid clip: {e}")
+        
+        print(f"✅ Gemini selected {len(valid_clips)} valid clips.")
+        return valid_clips
+
+    except Exception as e:
+        print(f"❌ Gemini API error (multi-clip): {e}")
+        raise
+
+
+def format_transcript_for_gemini(transcript_data):
+    formatted = []
+    for segment in transcript_data.get("segments", []):
+        start = segment.get("start", 0.0)
+        end = segment.get("end", 0.0)
+        text = segment.get("text", "").strip()
+        if text:
+            formatted.append(f"[{start:.2f}-{end:.2f}] {text}")
+    return "\n".join(formatted)
+
+
+def parse_gemini_response(response_text):
+    response_text = response_text.strip()
+    response_text = re.sub(r'^```json\s*', '', response_text)
+    response_text = re.sub(r'^```\s*', '', response_text)
+    response_text = re.sub(r'\s*```$', '', response_text)
+    
+    try:
+        return json.loads(response_text)
+    except:
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise ValueError("Invalid JSON format")
+
+
+def validate_clip_selection(result, hard_min_duration=15):
+    """
+    Validasi clip.
+    Menggunakan HARD MINIMUM (15s) untuk mencegah crash.
+    Parameter min_duration dari function call diabaikan untuk validasi error,
+    hanya digunakan sebagai guideline di prompt.
+    """
+    required_fields = ["start", "end", "title"]
+    for field in required_fields:
+        if field not in result:
+            raise ValueError(f"Missing field: {field}")
+
+    if "duration" not in result:
+        result["duration"] = result["end"] - result["start"]
+
+    # --- RELAXED VALIDATION LOGIC ---
+    duration = result["duration"]
+    
+    # Kalau di bawah 15 detik, anggap sampah/error
+    if duration < hard_min_duration:
+        raise ValueError(f"Duration {duration:.2f}s is below hard limit ({hard_min_duration}s)")
+    
+    # Kalau di bawah 60 detik (tapi di atas 15), cuma kasih warning, JANGAN CRASH
+    if duration < 60:
+        print(f"   ⚠️ Info: Short clip detected ({duration:.2f}s). Accepted for virality.")
+
+    if result["start"] < 0 or result["end"] <= result["start"]:
+        raise ValueError("Invalid timestamps")
+
+    # Defaults
+    if "description" not in result: result["description"] = result["title"]
+    if "hook" not in result: result["hook"] = result["title"]
+    if "viral_score" not in result: result["viral_score"] = 7.0
+    if "tags" not in result: result["tags"] = []
+    if "key_insight" not in result: result["key_insight"] = result["description"]
+    if "annotation_text" not in result: result["annotation_text"] = ""
+    if "annotation_start_offset" not in result: result["annotation_start_offset"] = 0.0
+
+    return result
+</file>
+
+<file path="reasoning/rag_search.py">
+def fetch_relevant_trends(transcript):
+    # TODO: vector DB search
+    return []
+</file>
+
+<file path="reasoning/viral_scorer.py">
+def score_clip_segment(segment, trend_data):
+    return 0.8
+</file>
+
+<file path="rendering/ffmpeg_builder.py">
+def build_ffmpeg_command(input_video, segment, crop, subs, output):
+    cmd = f"""
+    ffmpeg -y -i "{input_video}" 
+    -vf "crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}" 
+    -ss {segment['start']} -to {segment['end']}
+    -vf subtitles='{subs}'
+    "{output}"
+    """
+    return " ".join(cmd.split())
+</file>
+
+<file path="rendering/renderer.py">
+"""
+Video Renderer with Dynamic Multi-Shot Layout Compositor
+"""
+import os
+import subprocess
+
+
+class FFmpegRenderError(Exception):
+    pass
+
+
+COLOR_GRADING_PRESETS = {
+    "none": None,
+    "kodak_portra": {
+        "name": "Kodak Portra",
+        "filters": [
+            "curves=r='0/0.06 0.5/0.5 1/1':g='0/0.06 0.5/0.5 1/1':b='0/0.08 0.5/0.5 1/1'",
+            "eq=contrast=1.04:brightness=0.02:saturation=0.9",
+            "colorbalance=rs=0.07:gs=0.03:bs=-0.07:rm=0.04:gm=0.01:bm=-0.04:rh=0.02:gh=0:bh=-0.02",
+            "curves=master='0/0 0.6/0.65 1/0.98'",
+            "noise=alls=2:allf=t+u",
+        ],
+    },
+}
+
+
+def render_final_video(
+    input_path: str,
+    start_time: float,
+    end_time: float,
+    output_path: str,
+    shots: list = None,
+    crop_params: dict = None,
+    subtitle_path: str = None,
+    target_width: int = 1080,
+    target_height: int = 1920,
+    color_grading: str = "kodak_portra",
+    annotation_text: str = None,
+    annotation_start_offset: float = 5.0,
+    audio_path: str = None,
+):
+    print("🎬 Rendering video with FFmpeg...")
+    half_h = target_height // 2
+
+    if not shots:
+        shots = [crop_params] if crop_params else [{
+            "start": 0.0,
+            "end": end_time - start_time,
+            "mode": "single",
+            "crop_w": 606,
+            "crop_h": 1080,
+            "x": 0,
+            "y": 0,
+        }]
+
+    filter_complex = []
+    shot_labels = []
+
+    for idx, s in enumerate(shots):
+        s_start, s_end = s["start"], s["end"]
+        out_lbl = f"[v{idx}]"
+        shot_labels.append(out_lbl)
+
+        if s.get("mode") == "split":
+            cw, ch = s["crop_w"], s["crop_h"]
+            xt, yt = s["top"]["x"], s["top"]["y"]
+            xb, yb = s["bottom"]["x"], s["bottom"]["y"]
+
+            filter_complex.append(
+                f"[0:v]trim=start={s_start}:end={s_end},setpts=PTS-STARTPTS,split=2[s{idx}a][s{idx}b];"
+                f"[s{idx}a]crop={cw}:{ch}:{xt}:{yt},scale={target_width}:{half_h},setsar=1/1[s{idx}top];"
+                f"[s{idx}b]crop={cw}:{ch}:{xb}:{yb},scale={target_width}:{half_h},setsar=1/1[s{idx}bot];"
+                f"[s{idx}top][s{idx}bot]vstack,setsar=1/1{out_lbl}"
+            )
+        else:
+            cw, ch = s.get("crop_w", target_width), s.get("crop_h", target_height)
+            cx, cy = s.get("x", 0), s.get("y", 0)
+            filter_complex.append(
+                f"[0:v]trim=start={s_start}:end={s_end},setpts=PTS-STARTPTS,"
+                f"crop={cw}:{ch}:{cx}:{cy},scale={target_width}:{target_height},setsar=1/1{out_lbl}"
+            )
+
+    # Concat all shot segments
+    if len(shot_labels) > 1:
+        filter_complex.append(f"{''.join(shot_labels)}concat=n={len(shot_labels)}:v=1:a=0,format=yuv420p,setsar=1/1[v_base]")
+        current_stream = "[v_base]"
+    else:
+        current_stream = shot_labels[0]
+
+    # Post processing
+    post_filters = []
+    if color_grading in COLOR_GRADING_PRESETS and COLOR_GRADING_PRESETS[color_grading]:
+        post_filters.extend(COLOR_GRADING_PRESETS[color_grading]["filters"])
+
+    if annotation_text:
+        end_offset = annotation_start_offset + 5.0
+        escaped_txt = str(annotation_text).replace("'", "’").replace("\\", "\\\\").replace(":", "\\:")
+        post_filters.append(
+            f"drawtext=text='{escaped_txt}':"
+            f"fontfile='/System/Library/Fonts/Supplemental/Arial Bold.ttf':"
+            f"fontsize=68:fontcolor=white:box=1:boxcolor=0x000000@0.7:"
+            f"x=(w-text_w)/2:y=120:enable='between(t,{annotation_start_offset},{end_offset})'"
+        )
+
+    if subtitle_path and os.path.exists(subtitle_path):
+        escaped_sub = str(subtitle_path).replace("'", "\\'")
+        post_filters.append(f"subtitles=filename='{escaped_sub}'")
+
+    if post_filters:
+        filter_complex.append(f"{current_stream}{','.join(post_filters)}[v_out]")
+        map_video = "[v_out]"
+    else:
+        map_video = current_stream
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_time),
+        "-to", str(end_time),
+        "-i", str(input_path),
+        "-filter_complex", ";".join(filter_complex),
+        "-map", map_video,
+        "-map", "0:a:0",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print("✅ FFmpeg completed successfully!")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FFmpeg error: {e.stderr}")
+        raise FFmpegRenderError(f"FFmpeg failed: {e.stderr}") from e
+</file>
+
+<file path="sensing/active_speaker.py">
+"""
+Smart Framing & Shot-Based Layout Planner (YOLOv8-based)
+"""
+from pathlib import Path
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+
+def detect_shots_and_crops(
+    video_path: str,
+    start_time: float,
+    end_time: float,
+    target_width: int = 1080,
+    target_height: int = 1920,
+    **kwargs
+) -> list[dict]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return [{
+            "start": 0.0,
+            "end": end_time - start_time,
+            "mode": "single",
+            "x": 0,
+            "y": 0,
+            "w": 606,
+            "h": 1080,
+        }]
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    model_file = "yolov8n-face.pt" if Path("yolov8n-face.pt").exists() else "yolov8n.pt"
+    try:
+        model = YOLO(model_file)
+    except Exception:
+        cap.release()
+        return [{
+            "start": 0.0,
+            "end": end_time - start_time,
+            "mode": "single",
+            "x": (width - 606) // 2,
+            "y": 0,
+            "w": 606,
+            "h": height,
+        }]
+
+    start_frame = int(max(0.0, start_time) * fps)
+    end_frame = int(min(end_time * fps, total_frames))
+    step = max(1, int(0.3 * fps))
+
+    # 1. Scene cuts detection
+    cuts = [start_frame]
+    prev_gray = None
+    for f_idx in range(start_frame, end_frame, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        small = cv2.resize(frame, (160, 90))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            diff = np.mean(cv2.absdiff(gray, prev_gray))
+            if diff > 26.0 and (f_idx - cuts[-1]) >= int(0.75 * fps):
+                cuts.append(f_idx)
+        prev_gray = gray
+    cuts.append(end_frame)
+
+    shots_plan = []
+    for i in range(len(cuts) - 1):
+        s_start_f, s_end_f = cuts[i], cuts[i + 1]
+        t_start = (s_start_f - start_frame) / fps
+        t_end = (s_end_f - start_frame) / fps
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, (s_start_f + s_end_f) // 2)
+        ret, frame = cap.read()
+
+        faces = []
+        if ret:
+            results = model(frame, verbose=False)
+            for r in results:
+                for box in r.boxes:
+                    if float(box.conf[0]) >= 0.4:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        faces.append({
+                            "cx": float((x1 + x2) / 2.0),
+                            "cy": float((y1 + y2) / 2.0),
+                            "w": float(x2 - x1),
+                            "h": float(y2 - y1),
+                        })
+
+        faces.sort(key=lambda f: f["cx"])
+
+        # Dual speaker -> stacked split (top/bottom)
+        if len(faces) >= 2 and (faces[-1]["cx"] - faces[0]["cx"]) > (width * 0.25):
+            f_top, f_bot = faces[0], faces[-1]
+            split_box_h = int(min(height, max(f_top["h"], f_bot["h"]) * 3.2))
+            split_box_h = max(int(height * 0.65), split_box_h)
+            split_box_w = int(split_box_h * (9 / 8))
+            split_box_w -= (split_box_w % 2)
+            split_box_h -= (split_box_h % 2)
+
+            def get_box(face):
+                bx = int(face["cx"] - (split_box_w / 2))
+                by = int(face["cy"] - (split_box_h * 0.38))
+                bx = max(0, min(bx, width - split_box_w))
+                by = max(0, min(by, height - split_box_h))
+                return bx, by
+
+            x_top, y_top = get_box(f_top)
+            x_bot, y_bot = get_box(f_bot)
+
+            shots_plan.append({
+                "start": round(t_start, 2),
+                "end": round(t_end, 2),
+                "mode": "split",
+                "crop_w": split_box_w,
+                "crop_h": split_box_h,
+                "top": {"x": x_top, "y": y_top},
+                "bottom": {"x": x_bot, "y": y_bot},
+            })
+        else:
+            single_w = int(height * (9 / 16))
+            single_w -= (single_w % 2)
+            target_cx = faces[0]["cx"] if faces else (width / 2)
+            cx = int(target_cx - (single_w / 2))
+            cx = max(0, min(cx, width - single_w))
+
+            shots_plan.append({
+                "start": round(t_start, 2),
+                "end": round(t_end, 2),
+                "mode": "single",
+                "crop_w": single_w,
+                "crop_h": height,
+                "x": cx,
+                "y": 0,
+            })
+
+    cap.release()
+    print(f"   🎬 Generated {len(shots_plan)} shot layout(s).")
+    return shots_plan
+</file>
+
+<file path="sensing/diarization.py">
+def diarize_speakers(audio_path):
+    # TODO: Integrate pyannote.audio
+    return []
+</file>
+
+<file path="sensing/whisper_transcriber.py">
+import subprocess
+import json
+import os
+import re
+from pathlib import Path
+import srt
+
+# === PATH CONFIGURATION (M4 OPTIMIZED) ===
+CURRENT_FILE = Path(__file__).resolve()
+SENSING_DIR = CURRENT_FILE.parent
+PROJECT_ROOT = SENSING_DIR.parent 
+
+# Folder whisper.cpp ada di root project
+WHISPER_CPP_DIR = PROJECT_ROOT / "whisper.cpp"
+
+# Binary Location
+BIN_PATH = WHISPER_CPP_DIR / "build" / "bin"
+WHISPER_EXEC = BIN_PATH / "whisper-cli"
+
+# Model Location (Large V3 Turbo)
+MODEL_PATH = WHISPER_CPP_DIR / "models" / "ggml-large-v3-turbo.bin"
+
+# === DEBUG PATH ===
+print(f"-------- M4 WHISPER CONFIG --------")
+print(f"Project Root    : {PROJECT_ROOT}")
+print(f"Whisper Binary  : {WHISPER_EXEC}")
+print(f"Model Path      : {MODEL_PATH}")
+print(f"Binary Ready?   : {WHISPER_EXEC.exists()}")
+print(f"-----------------------------------")
+
+def extract_audio(video_path, audio_path):
+    """
+    FFmpeg Safe Mode.
+    Mengubah video ke WAV format 'Canonical' (16kHz, Mono, 16-bit).
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",               # Overwrite
+        "-i", video_path,   # Input
+        "-vn",              # No Video
+        "-ac", "1",         # Mono (Wajib)
+        "-ar", "16000",     # 16kHz (Wajib)
+        "-c:a", "pcm_s16le",# 16-bit Integer
+        "-f", "wav",        # Container WAV
+        str(audio_path)
+    ]
+    
+    print(f"🎤 [M4-Job] Extracting Audio: {audio_path}")
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FFmpeg Error: {e.stderr.decode()}")
+        raise Exception("Gagal ekstraksi audio via FFmpeg.")
+
+    if not Path(audio_path).exists() or os.path.getsize(audio_path) < 100:
+        raise Exception(f"File audio kosong/korup: {audio_path}")
+        
+    print(f"✅ Audio Ready.")
+
+def parse_whisper_timestamp(ts_str):
+    """Mengubah format '00:00:01,000' menjadi float seconds."""
+    try:
+        h, m, s = ts_str.split(':')
+        s, ms = s.split(',')
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+    except:
+        return 0.0
+
+def _get_all_words_flat(segments, time_offset=0.0):
+    """
+    Mengambil semua kata dari SRT segments ke dalam satu list datar dengan estimasi timing.
+    """
+    all_words = []
+    
+    for seg in segments:
+        seg_text = seg.content.replace('\n', ' ').strip()
+        start_sec = seg.start.total_seconds()
+        end_sec = seg.end.total_seconds()
+        
+        words = seg_text.split()
+        if not words:
+            continue
+            
+        # Estimasi timing yang lebih ketat (membagi durasi segmen ke setiap kata)
+        avg_duration_per_word = (end_sec - start_sec) / len(words)
+        current_time = start_sec
+        
+        for word_text in words:
+            word_end_time = current_time + avg_duration_per_word
+            
+            all_words.append({
+                "text": word_text,
+                "start": round(current_time + time_offset, 2),
+                "end": round(word_end_time + time_offset, 2),
+                "confidence": 0.99 
+            })
+            current_time = word_end_time
+            
+    return all_words
+
+
+def _rechunk_srt_to_data(srt_path, pause_threshold=0.35):
+    """
+    Membaca SRT, mengekstrak kata-kata, dan ME-RECHUNK menjadi segmen
+    berdasarkan jeda bicara (pause_threshold) dan tanda baca akhir kalimat.
+    """
+    final_data = {
+        "text": "",
+        "segments": [],
+        "language": "id"
+    }
+
+    try:
+        segments_srt = srt.parse(Path(srt_path).read_text(encoding="utf-8"))
+    except:
+        print("⚠️ SRT parsing failed. Check file encoding.")
+        return final_data
+
+    # 1. First Pass: Kumpulkan semua kata ke list datar dengan estimasi timing
+    all_words = _get_all_words_flat(segments_srt) 
+    
+    if not all_words:
+        return final_data
+    
+    # 2. Second Pass: Re-chunking cerdas
+    current_segment_words = []
+    
+    for i, word in enumerate(all_words):
+        current_segment_words.append(word)
+
+        should_break = False
+        
+        # Cek Jeda (Pause Threshold)
+        if i < len(all_words) - 1:
+            next_word_start = all_words[i+1]['start']
+            current_word_end = word['end']
+            pause_duration = next_word_start - current_word_end
+            
+            # Aturan 1: Jika jeda signifikan (misalnya 0.35 detik)
+            if pause_duration >= pause_threshold:
+                should_break = True
+                
+        # Aturan 2: Break pada tanda baca akhir kalimat (selalu membuat break, terlepas dari jeda)
+        # Kita gunakan .strip() untuk memastikan tanda baca ada di akhir kata (hasil Whisper)
+        if word["text"].strip().endswith((".", "?", "!", ":", ";")):
+            should_break = True
+
+        # Eksekusi Break
+        if should_break and current_segment_words:
+            final_data["segments"].append(_create_final_segment(current_segment_words))
+            current_segment_words = [] 
+
+    # Proses segmen terakhir
+    if current_segment_words:
+        final_data["segments"].append(_create_final_segment(current_segment_words))
+        
+    # Re-construct full text dan simpan
+    final_data["text"] = _get_segment_text(all_words)
+    
+    return final_data # HANYA me-return data
+
+
+def _create_final_segment(words):
+    """Membuat segmen JSON dari list kata."""
+    text = _get_segment_text(words)
+    return {
+        "start": words[0]["start"],
+        "end": words[-1]["end"],
+        "text": text,
+        "words": words
+    }
+
+def _get_segment_text(words):
+    """Menggabungkan teks dari list kata menjadi satu string."""
+    return " ".join([w["text"] for w in words]).strip()
+
+def fmt_time_ass(seconds):
+    """Format waktu detik ke ASS (H:MM:SS.cs)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    centisecs = int((seconds - int(seconds)) * 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
+
+def create_ass_file(json_data, ass_path, title="Video"):
+    """
+    Generate file subtitle .ass yang persis seperti sample test-030.ass.
+    Menggunakan format event Dialogue standar.
+    """
+    header = f"""[Script Info]
+Title: {title}
+ScriptType: v4.00+
+
+[V4+ Styles]
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,10
+
+[Events]
+"""
+    try:
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(header)
+            segments = json_data.get("segments", [])
+            for seg in segments:
+                start = fmt_time_ass(seg.get("start", 0))
+                end = fmt_time_ass(seg.get("end", 0))
+                text = seg.get("text", "").strip()
+                if text:
+                    f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,, {text}\n")
+        print(f"📝 ASS Subtitle saved: {ass_path}")
+    except Exception as e:
+        print(f"⚠️ Gagal membuat ASS: {e}")
+
+def whisper_transcribe(audio_path, out_json, fast_mode=True):
+    # Validasi File
+    if not WHISPER_EXEC.exists():
+        raise FileNotFoundError(f"❌ Binary Whisper tidak ditemukan di: {WHISPER_EXEC}\nSilakan jalankan langkah build ulang.")
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"❌ Model tidak ditemukan di: {MODEL_PATH}")
+
+    audio_path = Path(audio_path)
+    output_stem_path = audio_path.parent / audio_path.stem
+    srt_path = output_stem_path.with_suffix(".srt")
+
+    # COMMAND OPTIMAL UNTUK M4 CHIP
+    # Note: Kita gunakan -owts (output word timestamps) untuk mendapatkan 'tokens' di JSON
+    cmd = [
+        str(WHISPER_EXEC),
+        "-m", str(MODEL_PATH),
+        "-f", str(audio_path),
+        "-l", "id",       
+        "-t", "8",        
+        "-osrt",            # PENTING: Output SRT
+        "-sow",             # PENTING: Split on word (Membuat baris SRT sangat pendek)
+        "-ml", "1",         # Max token length 1 (untuk timing token/kata)
+        "-of", str(output_stem_path),
+        "-np",            
+        "--prompt", "Gunakan bahasa Indonesia formal dan gaul."
+    ]
+
+    print(f"🚀 [M4-Job] Transcribing (SRT Word-Level Mode)...")
+    
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    # Cek Error
+    if result.returncode != 0:
+        if result.returncode == 10:
+            print("❌ Error 10: Format WAV invalid. Pastikan extract_audio berjalan benar.")
+        else:
+            print(f"❌ Whisper Error Code: {result.returncode}")
+            print(f"STDERR: {result.stderr}")
+        raise Exception("Transkripsi Whisper gagal.")
+
+    # 1. Parsing SRT
+    if not srt_path.exists():
+        raise FileNotFoundError("Whisper selesai tapi SRT output tidak muncul.")
+
+    print(f"📝 Parsing SRT output...")
+    
+    # 2. KONVERSI STRUKTUR ke JSON standar Anda (memanggil fungsi baru)
+    # PENTING: Panggil _rechunk_srt_to_data (tanpa argumen out_json)
+    final_data = _rechunk_srt_to_data(srt_path)
+
+    # 3. Simpan JSON Final 
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(final_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"💾 JSON (Standardized from SRT) saved: {out_json}")
+    
+    # 4. Generate ASS
+    ass_path = Path(out_json).with_suffix(".ass")
+    create_ass_file(final_data, ass_path, title=audio_path.stem)
+
+    return final_data
+
+if __name__ == "__main__":
+    pass
+</file>
+
+<file path="sensing/yolov8_detector.py">
+"""
+YOLOv8 Face Detection dengan Spatial Clustering & Subject Locking.
+
+Fitur Utama:
+1. Auto-download model 'yolov8n-face.pt'.
+2. Mendeteksi SEMUA wajah di setiap frame sampel.
+3. Spatial Clustering: Mengelompokkan wajah berdasarkan posisi horizontal (X).
+4. Subject Locking: Memilih satu subjek utama berdasarkan konsistensi & ukuran, 
+   lalu membuang noise (wajah orang lain) agar crop stabil.
+"""
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import os
+import torch
+import requests
+from collections import defaultdict
+
+def download_face_model(model_name="yolov8n-face.pt"):
+    """Download model YOLO Face khusus jika belum ada"""
+    if os.path.exists(model_name):
+        return str(model_name)
+    
+    print(f"📥 Downloading {model_name} (Face Specific Model)...")
+    url = "https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov8n-face.pt"
+    
+    try:
+        response = requests.get(url, allow_redirects=True)
+        with open(model_name, 'wb') as f:
+            f.write(response.content)
+        print("✅ Model downloaded successfully.")
+        return str(model_name)
+    except Exception as e:
+        print(f"⚠️ Failed to download face model: {e}")
+        return "yolov8n.pt"
+
+def _filter_dominant_subject(all_detections, screen_width):
+    """
+    Logika Cerdas: Mengelompokkan deteksi wajah berdasarkan posisi X,
+    lalu memilih 1 cluster subjek utama untuk di-lock.
+    
+    Mencegah kamera lompat-lompat antara dua orang.
+    """
+    if not all_detections:
+        return []
+
+    # 1. Clustering Sederhana berdasarkan Center X
+    # Kita anggap wajah yang jarak X-nya dekat (< 15% lebar layar) adalah orang yang sama
+    threshold = 0.15 
+    clusters = [] # List of {'sum_x': 0, 'count': 0, 'sum_area': 0, 'items': []}
+
+    # Urutkan deteksi berdasarkan posisi X untuk memudahkan grouping
+    sorted_dets = sorted(all_detections, key=lambda x: x['center_x'])
+
+    for det in sorted_dets:
+        placed = False
+        for cluster in clusters:
+            # Hitung rata-rata X cluster saat ini
+            avg_x = cluster['sum_x'] / cluster['count']
+            
+            # Jika dekat dengan rata-rata cluster, masukkan
+            if abs(det['center_x'] - avg_x) < threshold:
+                cluster['sum_x'] += det['center_x']
+                cluster['sum_area'] += det['area']
+                cluster['count'] += 1
+                cluster['items'].append(det)
+                placed = True
+                break
+        
+        # Jika tidak cocok dengan cluster manapun, buat cluster baru
+        if not placed:
+            clusters.append({
+                'sum_x': det['center_x'],
+                'sum_area': det['area'],
+                'count': 1,
+                'items': [det]
+            })
+
+    # 2. Scoring Cluster (Menentukan Subjek Utama)
+    # Score = Konsistensi (Count) * Ukuran Rata-rata (Avg Area)
+    # Kita lebih memprioritaskan yang sering muncul (Count)
+    best_cluster = None
+    best_score = -1
+
+    print(f"   📊 Found {len(clusters)} unique face position(s):")
+    
+    for i, c in enumerate(clusters):
+        avg_area = c['sum_area'] / c['count']
+        avg_x = c['sum_x'] / c['count']
+        
+        # Bobot: 70% frekuensi muncul, 30% ukuran wajah
+        # Ini mencegah orang yang lewat sebentar tapi dekat kamera (besar) menang
+        score = (c['count'] ** 1.5) * (avg_area)
+        
+        pos_label = "Left" if avg_x < 0.4 else "Right" if avg_x > 0.6 else "Center"
+        print(f"      Position {pos_label} (X={avg_x:.2f}): Frames={c['count']}, Area={avg_area:.0f}, Score={score:.2f}")
+
+        if score > best_score:
+            best_score = score
+            best_cluster = c
+
+    # 3. Return hanya item milik pemenang
+    if best_cluster:
+        avg_x_winner = best_cluster['sum_x'] / best_cluster['count']
+        print(f"   ✅ Locking Subject at X={avg_x_winner:.2f}")
+        return best_cluster['items']
+    
+    return all_detections
+
+def detect_faces(video_path, sample_frames=None, start_time=None, end_time=None, interval_ms=500):
+    """
+    Detect faces dengan Subject Locking.
+    """
+    
+    # Load Model
+    model_file = download_face_model()
+    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    
+    try:
+        model = YOLO(model_file)
+    except:
+        print("⚠️ Failed loading face model, fallback to standard.")
+        model = YOLO("yolov8n.pt")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration = total_frames / fps if fps > 0 else 0
+
+    # Range Scan
+    start_sec = max(0, start_time if start_time is not None else 0)
+    end_sec = min(video_duration, end_time if end_time is not None else video_duration)
+
+    # Sampling Interval (Default 250ms agar lebih presisi menangkap gerakan)
+    # Semakin kecil interval, semakin akurat clustering-nya
+    actual_interval_ms = 250 
+    print(f"🔍 Scanning faces: {start_sec:.1f}s - {end_sec:.1f}s (Step: {actual_interval_ms}ms)")
+
+    raw_detections = []
+    current_time = start_sec
+
+    while current_time < end_sec:
+        cap.set(cv2.CAP_PROP_POS_MSEC, current_time * 1000)
+        ret, frame = cap.read()
+        if not ret: break
+
+        # Inference
+        results = model(frame, verbose=False, device=device)
+        
+        # Ambil SEMUA wajah yang valid di frame ini (bukan cuma yang terbesar)
+        # Kita akan filter nanti
+        for result in results:
+            for box in result.boxes:
+                conf = float(box.conf[0])
+                if conf < 0.5: continue # Confidence threshold
+
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                area = (x2 - x1) * (y2 - y1)
+                
+                # Normalize center X (0.0 - 1.0)
+                center_x = ((x1 + x2) / 2) / width
+                center_y = ((y1 + y2) / 2) / height
+
+                raw_detections.append({
+                    "time": float(current_time),
+                    "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                    "confidence": conf,
+                    "center_x": center_x,
+                    "center_y": center_y,
+                    "area": area
+                })
+
+        current_time += (actual_interval_ms / 1000.0)
+
+    cap.release()
+
+    # --- TAHAP PENTING: CLUSTERING & LOCKING ---
+    # Kita filter deteksi mentah untuk hanya mengambil subjek utama
+    final_detections = _filter_dominant_subject(raw_detections, width)
+    
+    return final_detections
+</file>
+
+<file path="utils/drive_io.py">
+from googleapiclient.http import MediaFileUpload
+
+def upload_to_drive(file_path, folder_id, drive_service):
+    file_metadata = {"name": file_path.split('/')[-1], "parents": [folder_id]}
+    media = MediaFileUpload(file_path, resumable=True)
+
+    request = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id"
+    )
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+
+    return response.get("id")
+</file>
+
+<file path="utils/file_utils.py">
+import os
+
+def ensure_dirs():
+    os.makedirs("raw", exist_ok=True)
+    os.makedirs("temp", exist_ok=True)
+    os.makedirs("finished", exist_ok=True)
+</file>
+
+<file path="utils/logger.py">
+def log(msg):
+    print(f"[LOG] {msg}")
+</file>
+
+<file path="utils/sheet_io.py">
+import uuid
+from datetime import datetime
+
+def get_pending_job(sheet, SPREADSHEET_ID, RANGE_NAME):
+    """
+    Get pending job from Google Sheets
+
+    Expected columns:
+    A: job_id
+    B: youtube_url
+    C: raw_file_id (optional)
+    D: finished_file_id (optional)
+    E: status
+    """
+    result = sheet.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=RANGE_NAME
+    ).execute()
+
+    rows = result.get("values", [])
+
+    # Debug: print semua rows
+    print(f"📊 Found {len(rows)} rows in spreadsheet")
+
+    if not rows:
+        return None, None
+
+    for idx, row in enumerate(rows, start=2):
+        # Debug: print setiap row
+        print(f"🔍 Row {idx}: {len(row)} columns -> {row}")
+
+        # Check if row has at least 5 columns (job_id, youtube_url, raw_id, finished_id, status)
+        if len(row) < 5:
+            print(f"   → Skipped: Not enough columns (need 5, got {len(row)})")
+            continue
+
+        # Extract status (column E = index 4)
+        status = row[4].strip().lower() if len(row) > 4 else ""
+        print(f"   → job_id='{row[0]}', status='{status}'")
+
+        if status != "pending":
+            print(f"   → Skipped: Status is '{status}', not 'pending'")
+            continue
+
+        job = {
+            "row": idx,
+            "job_id": row[0],
+            "youtube_url": row[1]
+        }
+        print(f"✅ Found pending job: {job}")
+        return idx, job
+
+    print("⚠️  No pending jobs found")
+    return None, None
+
+
+def update_status(sheet, SPREADSHEET_ID, row, status):
+    """Update status di kolom E"""
+    sheet.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Jobs!E{row}",
+        valueInputOption="RAW",
+        body={"values": [[status]]}
+    ).execute()
+    print(f"📝 Updated row {row} status to: {status}")
+
+
+def update_raw_file_id(sheet, SPREADSHEET_ID, row, file_id):
+    """Update raw_file_id di kolom C"""
+    sheet.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Jobs!C{row}",
+        valueInputOption="RAW",
+        body={"values": [[file_id]]}
+    ).execute()
+    print(f"📝 Updated row {row} raw_file_id to: {file_id}")
+
+
+def update_finished_file_id(sheet, SPREADSHEET_ID, row, file_id):
+    """Update finished_file_id di kolom D"""
+    sheet.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Jobs!D{row}",
+        valueInputOption="RAW",
+        body={"values": [[file_id]]}
+    ).execute()
+    print(f"📝 Updated row {row} finished_file_id to: {file_id}")
+
+
+def update_clip_metadata(sheet, SPREADSHEET_ID, row, title, description, viral_score):
+    """
+    Update clip metadata (title, description, viral_score) from Gemini AI
+
+    Columns:
+    F: title (Gemini-generated)
+    G: description (Gemini-generated)
+    H: viral_score (1-10)
+    """
+    # Update title (column F)
+    sheet.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Jobs!F{row}",
+        valueInputOption="RAW",
+        body={"values": [[title]]}
+    ).execute()
+
+    # Update description (column G)
+    sheet.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Jobs!G{row}",
+        valueInputOption="RAW",
+        body={"values": [[description]]}
+    ).execute()
+
+    # Update viral_score (column H)
+    sheet.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Jobs!H{row}",
+        valueInputOption="RAW",
+        body={"values": [[viral_score]]}
+    ).execute()
+
+    print(f"📝 Updated row {row} clip metadata:")
+    print(f"   Title: {title}")
+    print(f"   Description: {description[:50]}..." if len(description) > 50 else f"   Description: {description}")
+    print(f"   Viral Score: {viral_score}/10")
+
+
+def append_clip_to_sheet(sheet, SPREADSHEET_ID, parent_job_id, drive_file_id, title, description, tags, target_channel):
+    try:
+        clip_id = str(uuid.uuid4())
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # --- PERBAIKAN DI SINI ---
+        # Jika tags berupa list, gabungkan jadi string koma (misal: "saham, investasi, uang")
+        # Jika tags None, ubah jadi string kosong
+        if isinstance(tags, list):
+            tags_formatted = ", ".join(tags) 
+        else:
+            tags_formatted = str(tags) if tags else ""
+        # -------------------------
+
+        values = [[
+            clip_id,
+            parent_job_id,
+            drive_file_id,
+            title,
+            description,
+            tags_formatted, # <--- Gunakan variabel yang sudah diformat string
+            target_channel,
+            "READY",
+            timestamp
+        ]]
+        
+        # Append ke sheet 'Clips'
+        body = {'values': values}
+        range_name = 'Clips!A2:I'  # A-I adalah 9 kolom
+        
+        result = sheet.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_name,
+            valueInputOption='RAW',
+            insertDataOption='INSERT_ROWS',
+            body=body
+        ).execute()
+        
+        print(f"📋 Added clip to sheet: {title} (ID: {clip_id})")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Failed to add clip to sheet: {e}")
+        raise
+
+
+def mark_job_complete(sheet, SPREADSHEET_ID, row, raw_fid, fin_fid):
+    """
+    Menandai job utama sebagai selesai di sheet 'Jobs'.
+    """
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # --- LANGKAH 1: Update File ID dan Status (Kolom C, D, E) ---
+        # Range C sampai E (3 Kolom)
+        job_range = f"Jobs!C{row}:E{row}"
+        
+        # PERBAIKAN: Pastikan list hanya berisi 3 item!
+        # [raw_file_id, output_file_id, status]
+        # Hapus 'timestamp' dari list ini agar tidak meluap ke kolom F
+        values = [[raw_fid, fin_fid, "done"]] 
+        
+        sheet.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=job_range,
+            valueInputOption='RAW',
+            body={'values': values}
+        ).execute()
+
+        # --- LANGKAH 2: Update Timestamp (Kolom L) ---
+        # Sesuai header CSV Anda, 'updated_at' ada di kolom L (urutan ke-12)
+        time_range = f"Jobs!L{row}"
+        
+        sheet.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=time_range,
+            valueInputOption='RAW',
+            body={'values': [[timestamp]]}
+        ).execute()
+        
+        print(f"✅ Marked job at row {row} as DONE (Updated timestamp in Col L)")
+        
+    except Exception as e:
+        print(f"❌ Failed to mark job complete: {e}")
+        raise
+</file>
+
+<file path=".env.example">
+# Gemini AI API Key (for intelligent clip selection)
+# Get your API key from: https://aistudio.google.com/app/apikey
+GEMINI_API_KEY=your_gemini_api_key_here
+</file>
+
+<file path=".gitignore">
+cat > .gitignore << 'EOF'
+# ============================================
+# SECURITY - NEVER COMMIT
+# ============================================
+repomix-output.xml
+repomix-output-*.xml
+credentials.json
+token.json
+.env
+.env.*
+!.env.example
+cookies.txt
+*.secret
+*.key
+*.pem
+*.crt
+
+# ============================================
+# PYTHON
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+env/
+ENV/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# ============================================
+# AI/ML MODELS (LARGE FILES)
+# ============================================
+*.pt
+*.pth
+*.h5
+*.pb
+*.onnx
+*.tflite
+*.bin
+models/
+ggml-*.bin
+yolov8n*.pt
+
+# ============================================
+# DATA & OUTPUT FILES
+# ============================================
+raw/
+temp/
+finished/
+uploads/
+storage/
+pdf/
+*.mp3
+*.mp4
+*.wav
+*.flac
+*.ogg
+*.aac
+*.mov
+*.avi
+*.mkv
+
+# ============================================
+# DATABASE & SESSION FILES
+# ============================================
+*.sql
+*.sqlite
+*.db
+*.db-journal
+wa_session/
+session/
+*.session
+
+# ============================================
+# LOGS & TEMPORARY FILES
+# ============================================
+*.log
+logs/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ============================================
+# OPERATING SYSTEM
+# ============================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================
+# IDE & EDITOR
+# ============================================
+.vscode/
+.idea/
+*.iml
+*.iws
+*.ipr
+.classpath
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ============================================
+# WHISPER.CPP SUBMODULE
+# ============================================
+whisper.cpp/
+!whisper.cpp/.git
+
+# ============================================
+# DOCKER
+# ============================================
+.dockerignore
+
+# ============================================
+# MISC
+# ============================================
+*.zip
+*.tar
+*.gz
+*.rar
+.DS_Store
+EOF
+</file>
+
+<file path="agent.py">
+from pathlib import Path
+from agents.agent_loop import run_agent
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from utils.file_utils import ensure_dirs
+
+SPREADSHEET_ID = "1gBg7RYDNm9reas-n5FDoYn3Hv1-wBvAZIslUPYIqWCo"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def get_credentials(token_path="token.json", secret_path="credentials.json"):
+    creds = None
+    token_file = Path(token_path)
+
+    if token_file.exists():
+        creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(secret_path, SCOPES)
+            creds = flow.run_local_server(port=0)
+        token_file.write_text(creds.to_json())
+
+    return creds
+
+
+def main():
+    ensure_dirs()
+    creds = get_credentials()
+    sheet_service = build("sheets", "v4", credentials=creds).spreadsheets()
+    drive_service = build("drive", "v3", credentials=creds)
+
+    run_agent(sheet_service, drive_service, SPREADSHEET_ID)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="docker-compose.yml">
+version: '3.8'
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n_engine
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_SECURE_COOKIE=false
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - NODE_ENV=production
+      - WEBHOOK_URL=http://localhost:5678/
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+  ai_clipper:
+    build: .
+    container_name: ai_clipper_agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Mount folder data lokal agar output video persisten
+      - ./raw:/app/raw
+      - ./temp:/app/temp
+      - ./finished:/app/finished
+      - ./credentials.json:/app/credentials.json
+      - ./token.json:/app/token.json
+    depends_on:
+      - n8n
+
+volumes:
+  n8n_data:
+</file>
+
+<file path="Dockerfile">
+FROM python:3.11-slim
+
+# Install system dependencies & build tools untuk whisper.cpp & ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ffmpeg \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirement & build
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Build whisper.cpp binary jika belum ter-build
+RUN cd whisper.cpp && rm -rf build && cmake -B build && cmake --build build --config Release -j$(nproc)
+
+CMD ["python", "-u", "-m", "agents.agent_loop"]
+</file>
+
+<file path="Dockerfile.txt">
+FROM python:3.11-slim
+
+# Install system dependencies & build tools untuk whisper.cpp & ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ffmpeg \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirement & build
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Build whisper.cpp binary jika belum ter-build
+RUN cd whisper.cpp && rm -rf build && cmake -B build && cmake --build build --config Release -j$(nproc)
+
+CMD ["python", "-u", "-m", "agents.agent_loop"]
+</file>
+
+<file path="export_youtube_cookies.sh">
+#!/bin/bash
+
+# Script untuk export YouTube cookies dari browser
+# Untuk mengatasi YouTube bot detection
+
+echo "============================================================"
+echo "🍪 EXPORT YOUTUBE COOKIES"
+echo "============================================================"
+echo ""
+echo "YouTube meminta verifikasi bot. Kita perlu export cookies dari browser."
+echo ""
+echo "📝 CARA 1: Otomatis (Recommended)"
+echo "   yt-dlp sudah support --cookies-from-browser"
+echo "   Agent akan otomatis coba cookies dari Chrome/Firefox/Safari"
+echo ""
+echo "   Yang perlu Anda lakukan:"
+echo "   1. Buka YouTube di browser (Chrome/Firefox/Safari)"
+echo "   2. Login ke akun YouTube"
+echo "   3. Buka video yang ingin di-download"
+echo "   4. Run agent lagi"
+echo ""
+echo "📝 CARA 2: Manual Export (Jika cara 1 gagal)"
+echo ""
+echo "   A. Install browser extension:"
+echo "      Chrome: Get cookies.txt LOCALLY"
+echo "      https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc"
+echo ""
+echo "      Firefox: cookies.txt"
+echo "      https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/"
+echo ""
+echo "   B. Buka YouTube dan login"
+echo ""
+echo "   C. Click extension icon → Export cookies"
+echo ""
+echo "   D. Save as: cookies.txt di folder project ini"
+echo ""
+echo "   E. Update downloader.py untuk use cookies.txt:"
+echo "      ydl_opts['cookiefile'] = 'cookies.txt'"
+echo ""
+echo "============================================================"
+echo ""
+echo "🔍 Checking browser cookies..."
+echo ""
+
+# Check if Chrome is installed
+if [ -d "$HOME/Library/Application Support/Google/Chrome" ]; then
+    echo "✅ Chrome detected"
+    echo "   Cookies location: $HOME/Library/Application Support/Google/Chrome/Default/Cookies"
+else
+    echo "❌ Chrome not found"
+fi
+
+# Check if Firefox is installed
+if [ -d "$HOME/Library/Application Support/Firefox" ]; then
+    echo "✅ Firefox detected"
+    echo "   Cookies location: $HOME/Library/Application Support/Firefox/Profiles/"
+else
+    echo "❌ Firefox not found"
+fi
+
+# Check if Safari is installed
+if [ -d "$HOME/Library/Safari" ]; then
+    echo "✅ Safari detected"
+    echo "   Cookies location: $HOME/Library/Cookies/Cookies.binarycookies"
+else
+    echo "❌ Safari not found"
+fi
+
+echo ""
+echo "============================================================"
+echo "✅ Agent sudah dikonfigurasi untuk otomatis use browser cookies"
+echo "   Pastikan Anda sudah login ke YouTube di browser"
+echo "============================================================"
+</file>
+
+<file path="generate_token.py">
+import os
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
+
+# Tentukan scope/izin (sesuaikan dengan kebutuhan Google Sheets Anda)
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+def generate():
+    # Pastikan file credentials.json ada di folder yang sama
+    if not os.path.exists('credentials.json'):
+        print("Error: File credentials.json tidak ditemukan! Download dulu dari Google Cloud Console.")
+        return
+
+    flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+    creds = flow.run_local_server(port=0)
+
+    # Simpan token untuk digunakan nanti
+    with open('token.json', 'w') as token:
+        token.write(creds.to_json())
+    print("Berhasil! File token.json telah dibuat.")
+
+if __name__ == '__main__':
+    generate()
+</file>
+
+<file path="google_auth_setup.py">
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets"
+]
+
+flow = InstalledAppFlow.from_client_secrets_file(
+    "credentials.json", SCOPES)
+creds = flow.run_local_server(port=0)
+
+with open("token.json", "w") as token:
+    token.write(creds.to_json())
+
+print("token.json berhasil dibuat.")
+</file>
+
+<file path="README.md">
+# 🤖 AI Agent Short Videos - Auto Editor
+
+Agent otomatis untuk mengubah video YouTube panjang menjadi video short vertical dengan **Gemini AI reasoning** untuk intelligent clip selection.
+
+## 🎯 Fitur Utama
+
+### ✨ NEW: Gemini AI Integration
+- 🧠 **Intelligent Clip Selection** - Gemini 1.5 Flash analyzes transcript and selects best 20-60s clip
+- 🎯 **Strong Hook Detection** - AI finds clips with powerful hooks in first 2-3 seconds
+- 📊 **Viral Score** - AI calculates viral potential (1-10 score)
+- 📝 **Auto Title & Description** - AI generates engaging titles in Indonesian informal style
+- 🏷️ **Smart Tags** - AI suggests relevant tags for better discoverability
+
+### 🎬 Complete Video Processing Pipeline
+
+#### STEP 1: YouTube Download
+- ✅ Download video from YouTube with cookie authentication
+- ✅ Support for age-restricted and private videos
+
+#### STEP 2: Audio Transcription (OPTIMIZED - 3-4x faster!)
+- ✅ Extract audio with single-pass FFmpeg (3-5x faster)
+- ✅ Whisper Medium model (3-5x faster than large-v3-turbo)
+- ✅ Word-level timestamps with confidence scores
+- ✅ Optimized parameters (beam=3, temp=0.0)
+- ✅ Aggressive noise reduction for better accuracy
+- ✅ Indonesian informal language support (gue, lu, kayak, banget)
+
+#### STEP 3: 🧠 Gemini AI Reasoning (NEW!)
+- ✅ Analyze full transcript for best clip
+- ✅ Find strong hooks (questions, shocking statements, bold claims)
+- ✅ Ensure complete story (standalone clip)
+- ✅ Calculate viral potential (1-10 score)
+- ✅ Generate title & description (Indonesian informal)
+- ✅ Suggest relevant tags
+
+#### STEP 4: Face Detection
+- ✅ YOLOv8 face detection for smart cropping
+- ✅ Sample 20 frames for accurate tracking
+- ✅ Confidence threshold optimization
+
+#### STEP 5: Dynamic Crop Calculation
+- ✅ Smart crop based on face positions
+- ✅ EMA motion smoothing for stable tracking
+- ✅ Fallback to center crop if no faces detected
+- ✅ 9:16 aspect ratio (1080x1920)
+
+#### STEP 6: Karaoke Subtitle Generation
+- ✅ ASS format with word-level karaoke effect
+- ✅ Sentence chunking (max 7 words, max 2.5s)
+- ✅ Time offset (+0.12s) for perfect sync
+- ✅ Styling: Arial Black, orange secondary color, outline, shadow
+
+#### STEP 7: Video Rendering
+- ✅ FFmpeg rendering with Gemini's selected clip timing
+- ✅ Dynamic crop (face-tracking)
+- ✅ Karaoke subtitles
+- ✅ **Fujifilm Vintage Cinematic color grading** (natural, film-like)
+- ✅ 1080x1920 vertical format
+
+#### STEP 8: Google Drive Upload
+- ✅ Upload raw video to Drive
+- ✅ Upload finished video to Drive
+- ✅ Return file IDs for tracking
+
+#### STEP 9: Google Sheets Update
+- ✅ Update status to "done"
+- ✅ Save raw_file_id and finished_file_id
+- ✅ **Save Gemini metadata** (title, description, viral_score)
+
+## 📋 Requirements
+
+```bash
+pip install -r requirements.txt
+```
+
+### Key Dependencies:
+- `openai-whisper` - Audio transcription (Medium model for speed)
+- `whisper-timestamped` - Word-level timestamps
+- `torchaudio` - Required for VAD (Voice Activity Detection)
+- `google-generativeai` - **Gemini AI API** (intelligent clip selection)
+- `yt-dlp` - YouTube downloader with cookie support
+- `ultralytics` - YOLOv8 face detection
+- `opencv-python` - Video processing
+- `google-api-python-client` - Google Drive & Sheets API
+- `ffmpeg` - Video rendering (install separately)
+
+## 🚀 Setup & Installation
+
+### 1. Install FFmpeg
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+
+# Windows
+# Download from: https://ffmpeg.org/download.html
+```
+
+### 2. Setup Google Cloud Credentials
+
+Buat file `credentials.json` dari Google Cloud Console dengan akses ke:
+- Google Drive API
+- Google Sheets API
+
+Run authentication:
+```bash
+python auth.py
+```
+
+### 3. Setup Gemini AI API Key
+
+1. Get API key from: https://aistudio.google.com/app/apikey
+2. Create `.env` file:
+
+```bash
+cp .env.example .env
+```
+
+3. Edit `.env` and add your API key:
+
+```
+GEMINI_API_KEY=your_gemini_api_key_here
+```
+
+### 4. Setup Google Sheets
+
+Format spreadsheet (sheet "Jobs"):
+
+| Column | Field | Description | Source |
+|--------|-------|-------------|--------|
+| A | job_id | Unique job ID | Manual |
+| B | youtube_url | YouTube URL | Manual |
+| C | raw_file_id | Raw video Drive ID | Agent |
+| D | finished_file_id | Finished video Drive ID | Agent |
+| E | status | pending/processing/done/error | Agent |
+| **F** | **title** | **Gemini-generated title** | **Gemini AI** ✨ |
+| **G** | **description** | **Gemini-generated description** | **Gemini AI** ✨ |
+| **H** | **viral_score** | **Viral potential (1-10)** | **Gemini AI** ✨ |
+- Column L: updated_at (timestamp)
+
+### 3. Jalankan Agent
+
+```bash
+python agent.py
+```
+
+Agent akan:
+1. Monitor Google Sheets setiap 5 detik
+2. Ambil job dengan status "downloading" dan assigned_to "mac_local"
+3. Process video secara otomatis
+4. Update status ke "done" atau "error"
+
+## 📁 Struktur Folder
+
+```
+.
+├── agent.py              # Main agent script
+├── credentials.json      # Google API credentials
+├── token.json           # OAuth token (auto-generated)
+├── requirements.txt     # Python dependencies
+├── raw/                 # Downloaded videos
+├── temp/                # Temporary files & transcripts
+└── finished/            # Final edited videos
+```
+
+## 🎨 Caption Styling
+
+Caption menggunakan styling yang menarik:
+- Font: Arial Bold
+- Size: 60px
+- Color: White
+- Stroke: Black (3px)
+- Position: Bottom area (75% dari atas)
+- Width: Full width dengan padding 50px kiri-kanan
+
+## 🔧 Customization
+
+### Ubah Scene Detection Threshold
+```python
+scenes = detect_scenes(raw_path, threshold=27.0)  # Default: 27.0
+```
+
+### Ubah Durasi Scene
+```python
+best_scene = select_best_scene(scenes, min_duration=10, max_duration=60)
+```
+
+### Ubah Video Resolution
+```python
+vertical_clip = reframe_to_vertical(raw_path, target_width=1080, target_height=1920)
+```
+
+### Ubah Caption Style
+Edit fungsi `create_caption_clip()` di `agent.py`
+
+## 📊 Workflow
+
+```
+YouTube URL → Download → Transcribe → Scene Detect → Reframe → Add Captions → Export → Upload → Done
+```
+
+## 🐛 Troubleshooting
+
+### Error: "No module named 'scenedetect'"
+```bash
+pip install scenedetect[opencv]
+```
+
+### Error: "MoviePy import error"
+Pastikan menggunakan MoviePy 2.x:
+```bash
+pip install moviepy==2.0.0
+```
+
+### Error: "Failed to load audio: No such file or directory"
+Ini terjadi karena yt-dlp mendownload file dengan ekstensi berbeda (.webm instead of .mp4).
+Agent sudah otomatis mendeteksi file yang sebenarnya, tapi jika masih error:
+1. Check folder `raw/` untuk melihat file yang terdownload
+2. Pastikan ffmpeg terinstall: `brew install ffmpeg` (macOS)
+
+### Error: "cannot import name 'crop' from 'moviepy.video.fx'"
+Update ke MoviePy 2.x yang menggunakan method `cropped()` bukan `crop()`:
+```bash
+pip install --upgrade moviepy
+```
+
+### Video terlalu gelap/terang
+Adjust scene detection threshold (nilai lebih tinggi = lebih sensitif)
+
+## 📝 License
+
+MIT License
+</file>
+
+<file path="requirements.txt">
+# ============================================
+# Google Gemini - Gunakan SDK terbaru
+# ============================================
+google-genai>=0.2.0
+# google-generativeai==0.3.2  # JANGAN PAKAI (deprecated)
+
+# ============================================
+# Core Dependencies
+# ============================================
+srt>=3.5.0
+numpy>=1.24.3
+opencv-python>=4.8.1.78
+opencv-contrib-python>=4.8.1.78
+Pillow>=10.3.0
+torch>=2.1.0
+torchvision>=0.16.0
+ultralytics>=8.0.220
+
+# ============================================
+# Audio Processing
+# ============================================
+librosa>=0.10.1
+soundfile>=0.12.1
+
+# ============================================
+# YouTube Downloader
+# ============================================
+yt-dlp>=2023.11.14
+
+# ============================================
+# Database
+# ============================================
+sqlalchemy>=2.0.23
+psycopg2-binary>=2.9.9
+alembic>=1.12.1
+
+# ============================================
+# Google Services
+# ============================================
+google-api-python-client>=2.108.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+
+# ============================================
+# Web Framework
+# ============================================
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# ============================================
+# HTTP Client & Utilities
+# ============================================
+httpx>=0.25.1
+requests>=2.31.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.6
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-magic>=0.4.27
+tqdm>=4.66.1
+colorama>=0.4.6
+loguru>=0.7.2
+
+# ============================================
+# Face & Active Speaker Detection
+# ============================================
+mediapipe>=0.10.0
+opencv-python>=4.8.1.78
+opencv-contrib-python>=4.8.1.78
+</file>
+
+</files>

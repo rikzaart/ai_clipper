@@ -2,9 +2,10 @@ cat > .gitignore << 'EOF'
 # ============================================
 # SECURITY - NEVER COMMIT
 # ============================================
-repomix-output.xml
-repomix-output-*.xml
+#repomix-output.xml
+#repomix-output-*.xml
 credentials.json
+client_secret_833578140496-cd3dh6chea7h8gqpons6smt5vn123q6r.apps.googleusercontent.com.json
 token.json
 .env
 .env.*
